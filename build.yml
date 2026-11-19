@@ -1,0 +1,169 @@
+name: Build WebView App
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'App Name (e.g., My Cool App)'
+        required: true
+        type: string
+      website_url:
+        description: 'Website URL (e.g., https://example.com)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build WebView APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Validate Inputs
+        run: |
+          if [ -z "${{ inputs.app_name }}" ]; then
+            echo "Error: App name is required"
+            exit 1
+          fi
+          if [ -z "${{ inputs.website_url }}" ]; then
+            echo "Error: Website URL is required"
+            exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Process App Icon
+        run: |
+          ICON_SRC="app_icon.png"
+
+          # Verify the uploaded icon exists in the repository
+          if [ ! -f "$ICON_SRC" ]; then
+            echo "Error: '$ICON_SRC' was not found in the repository root."
+            echo "Upload your 512x512 PNG logo to the repository root and name it exactly 'app_icon.png', then run the workflow again."
+            exit 1
+          fi
+
+          # Install ImageMagick for image processing
+          sudo apt-get update && sudo apt-get install -y imagemagick
+
+          # Verify the file is a valid, readable PNG image
+          if ! INFO=$(identify -format "%m %w %h" "${ICON_SRC}[0]" 2>&1); then
+            echo "Error: '$ICON_SRC' is not a valid image or cannot be opened: $INFO"
+            exit 1
+          fi
+          FORMAT=$(echo "$INFO" | awk '{print $1}')
+          WIDTH=$(echo "$INFO" | awk '{print $2}')
+          HEIGHT=$(echo "$INFO" | awk '{print $3}')
+          if [ "$FORMAT" != "PNG" ]; then
+            echo "Error: '$ICON_SRC' must be a PNG image (detected format: $FORMAT)."
+            exit 1
+          fi
+          echo "Uploaded icon: ${WIDTH}x${HEIGHT} PNG"
+          if [ "$WIDTH" != "512" ] || [ "$HEIGHT" != "512" ]; then
+            echo "Warning: expected a 512x512 image; got ${WIDTH}x${HEIGHT}. The image will be centered on a transparent square canvas and scaled."
+          fi
+
+          # Create icons for different densities (keeps transparency, centers on a square canvas)
+          make_icon() {
+            convert "${ICON_SRC}[0]" -background none -alpha on -resize "$1x$1" \
+              -gravity center -extent "$1x$1" "PNG32:$2"
+          }
+          make_icon 48 app/src/main/res/mipmap-mdpi/ic_launcher.png
+          make_icon 72 app/src/main/res/mipmap-hdpi/ic_launcher.png
+          make_icon 96 app/src/main/res/mipmap-xhdpi/ic_launcher.png
+          make_icon 144 app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+          make_icon 192 app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+          # Verify every launcher icon was generated
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            F="app/src/main/res/mipmap-$d/ic_launcher.png"
+            if [ ! -s "$F" ]; then
+              echo "Error: failed to generate $F"
+              exit 1
+            fi
+          done
+          echo "Launcher icons generated successfully."
+
+      - name: Configure App Settings
+        run: |
+          # Create the app configuration file
+          echo "APP_NAME=${{ inputs.app_name }}" > app/app.properties
+          echo "WEBSITE_URL=${{ inputs.website_url }}" >> app/app.properties
+          
+          # Update AndroidManifest.xml with app name
+          sed -i 's/android:label="[^"]*"/android:label="${{ inputs.app_name }}"/g' app/src/main/AndroidManifest.xml
+
+      - name: Create settings.gradle
+        run: |
+          # Sanitize app name for project name (remove special chars, replace spaces)
+          SANITIZED_NAME=$(echo "${{ inputs.app_name }}" | tr ' ' '_' | tr -cd '[:alnum:]_')
+          echo "pluginManagement {" > settings.gradle
+          echo "    repositories {" >> settings.gradle
+          echo "        google()" >> settings.gradle
+          echo "        mavenCentral()" >> settings.gradle
+          echo "        gradlePluginPortal()" >> settings.gradle
+          echo "    }" >> settings.gradle
+          echo "}" >> settings.gradle
+          echo "dependencyResolutionManagement {" >> settings.gradle
+          echo "    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)" >> settings.gradle
+          echo "    repositories {" >> settings.gradle
+          echo "        google()" >> settings.gradle
+          echo "        mavenCentral()" >> settings.gradle
+          echo "    }" >> settings.gradle
+          echo "}" >> settings.gradle
+          echo "rootProject.name = '${SANITIZED_NAME}'" >> settings.gradle
+          echo "include ':app'" >> settings.gradle
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+
+      - name: Build Debug APK
+        run: |
+          export APP_NAME="${{ inputs.app_name }}"
+          export WEBSITE_URL="${{ inputs.website_url }}"
+          # Generate unique package suffix from app name
+          PACKAGE_SUFFIX=$(echo "${{ inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]' | head -c 20)
+          export PACKAGE_SUFFIX="${PACKAGE_SUFFIX}"
+          gradle :app:assembleDebug --no-daemon
+
+      - name: Prepare Release
+        id: prepare_release
+        run: |
+          # Create a sanitized tag name from app name
+          # Replace spaces with dashes, remove special characters, convert to lowercase
+          TAG_NAME=$(echo "${{ inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd '[:alnum:]-' | head -c 50)
+          
+          # Add timestamp to make tag unique
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          TAG_NAME="${TAG_NAME}-${TIMESTAMP}"
+          
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "release_name=${{ inputs.app_name }}" >> $GITHUB_OUTPUT
+          
+          # Rename APK to match app name
+          SAFE_NAME=$(echo "${{ inputs.app_name }}" | tr ' ' '_' | tr -cd '[:alnum:]_')
+          cp app/build/outputs/apk/debug/app-debug.apk "${SAFE_NAME}.apk"
+          echo "apk_path=${SAFE_NAME}.apk" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.prepare_release.outputs.tag_name }}
+          name: ${{ steps.prepare_release.outputs.release_name }}
+          body: |
+            **App Name:** ${{ inputs.app_name }}
+            **Website URL:** ${{ inputs.website_url }}
+          files: ${{ steps.prepare_release.outputs.apk_path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
